@@ -1,3 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Generated artifacts (sample data is tracked; live forecasts are not)
+data/forecasts.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Legacy R session files
 .Rproj.user
 .Rhistory
 .RData
