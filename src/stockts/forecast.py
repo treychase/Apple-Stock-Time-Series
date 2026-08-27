@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .bayesian import PredictionInterval, predict_interval
+from .hmm import predict_interval_switching
 
 __all__ = ["ForecastTable", "forecast_universe", "rank_movers"]
 
@@ -41,12 +42,13 @@ def _row(ticker: str, pi: PredictionInterval) -> dict:
 
 def forecast_universe(
     history: pd.DataFrame,
-    horizon: int = 5,
+    horizon: int = 7,
     level: float = 0.95,
     min_obs: int = 30,
-    n_iter: int = 1500,
+    n_iter: int = 1200,
     burn_in: int = 400,
     seed: int | None = 610,
+    model: str = "hmm",
 ) -> ForecastTable:
     """Fit the Bayesian model to every column of ``history``.
 
@@ -60,14 +62,21 @@ def forecast_universe(
         Credible level for the prediction interval.
     min_obs:
         Skip tickers with fewer than this many finite observations.
+    model:
+        ``"hmm"`` (default) fits the two-state Markov-switching local-level
+        model, a DLM in each regime; ``"dlm"`` fits the single-regime local
+        level model kept in :mod:`stockts.bayesian`.
     """
+    if model not in {"hmm", "dlm"}:
+        raise ValueError("model must be 'hmm' or 'dlm'")
+    fit = predict_interval_switching if model == "hmm" else predict_interval
     rows: list[dict] = []
     for ticker in history.columns:
         series = history[ticker].dropna()
         if series.size < min_obs or (series <= 0).any():
             continue
         try:
-            pi = predict_interval(
+            pi = fit(
                 series.to_numpy(),
                 horizon=horizon,
                 level=level,

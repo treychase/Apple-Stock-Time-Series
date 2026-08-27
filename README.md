@@ -10,6 +10,10 @@ A Bayesian time-series engine and interactive dashboard that tracks an entire
 **posterior-predictive interval** for the price over the **next trading week**.
 The dashboard surfaces the projected **top 5** and **bottom 5** movers.
 
+The forecasting model is a **two-state hidden Markov model with a dynamic
+linear model in each state**: the same local-level DLM, but with its variances
+switching between a calm regime and a volatile one under a hidden Markov chain.
+
 > This project began as an R/Quarto course project analysing a single stock
 > (AAPL). It has been rewritten in **Python** and generalised to a full
 > universe with a dashboard and CI/CD. The original R analysis is preserved
@@ -19,10 +23,12 @@ The dashboard surfaces the projected **top 5** and **bottom 5** movers.
 
 ## Highlights
 
-- **Bayesian model** — local-level Dynamic Linear Model fit on log prices with
-  a Gibbs sampler (forward-filter/backward-sample for the latent level,
-  conjugate Inverse-Gamma updates for the variances). A NumPy port of the
-  original R sampler.
+- **Bayesian model** — a two-state Markov-switching local-level DLM fit on log
+  prices with a Gibbs sampler: FFBS for the latent level with the variances the
+  current regime implies, FFBS over the discrete chain for the regime path,
+  conjugate Inverse-Gamma updates for each regime's variances, and Dirichlet
+  updates for the transition matrix. The single-regime sampler it grew out of —
+  a NumPy port of the original R code — is still there as `predict_interval`.
 - **Universe-wide forecasts** — fit every ticker and rank by expected one-week
   return to get the projected top 5 / bottom 5.
 - **Interactive dashboard** — Streamlit + Plotly: per-ticker history with its
@@ -35,24 +41,55 @@ The dashboard surfaces the projected **top 5** and **bottom 5** movers.
 
 ## The model
 
-On the log price `y_t`:
+A hidden two-state Markov chain choosing between two DLMs, on the log price
+`y_t`:
 
 ```
-observation:  y_t     = θ_t + v_t,        v_t ~ N(0, V)
-state:        θ_t     = θ_{t-1} + w_t,    w_t ~ N(0, W)
-priors:       θ_0 ~ N(m0, C0),  V ~ IG(a_V, b_V),  W ~ IG(a_W, b_W)
+observation:  y_t     = θ_t + v_t,        v_t ~ N(0, κ[S_t]·V)
+state:        θ_t     = θ_{t-1} + w_t,    w_t ~ N(0, κ[S_t]·W)
+regime:       S_t | S_{t-1} ~ Categorical(P[S_{t-1}, :]),   S_t ∈ {0, 1}
+scale:        κ[0] = 1,  κ[1] > 1
+priors:       θ_0 ~ N(m0, C0),  V, W ~ IG(a, b),  κ[1] ~ IG(a, b) on (1, ∞),
+              P[s, :] ~ Dirichlet(α)
 ```
 
-The one-week forecast is the posterior predictive distribution of the price
-`horizon` (default 5 trading) days ahead: for each retained posterior draw of
-`(V, W, θ_last)` we propagate the random walk forward and add observation
-noise, then read off the requested quantiles and map back to price space.
+Both regimes are complete local-level DLMs: the calm one carries `(V, W)`, the
+volatile one `(κV, κW)`. Tying them to a common scale is a deliberate
+restriction, and it is what makes the two states mean something.
+
+Letting each regime own an unrestricted `(V[s], W[s])` looks more general and
+fails in the way that matters. On real price series the sampler stops splitting
+the history into quiet and turbulent stretches and starts splitting it by
+*attribution*: one state takes large observation noise with a slow level, the
+other a fast level with almost no noise. Measured on this repo's own sample
+data, that version put **86–100% of every ticker's history in a single state**
+and gave the other a self-transition probability around 0.5 — an outlier flag,
+not a regime. With the shared scale, κ comes out near **2.4** and the volatile
+state is occupied a few percent of the time in runs of about **ten days**,
+which is what volatility clustering actually looks like.
+
+Because κ > 1 by construction, **state 0 is the calm regime and state 1 the
+volatile one** in every draw — no relabelling step, and no chance of the two
+swapping mid-run.
+
+The forecast propagates the regime chain and the level forward together, so the
+predictive distribution is a **mixture over regime paths** rather than a single
+Gaussian: a stock that is calm today but sits in a jumpy regime carries a wider
+band than one that is calm and sticky. `predict_fan` returns every horizon from
+one day to `horizon` (default 7 trading days) out of a single fit, along with
+the fitted level, the smoothed probability of the volatile regime at every
+point in the history, each regime's daily volatility, and how persistent each
+regime is.
+
+The single-regime model is still available and still tested: pass
+`model="dlm"` to `forecast_universe`, or call `predict_interval` directly.
 
 ## Project layout
 
 ```
 src/stockts/
   bayesian.py     # Gibbs-sampled local-level DLM + predict_interval
+  hmm.py          # two-state Markov-switching DLM + predict_fan (the default)
   forecast.py     # forecast_universe + top5/bottom5 ranking
   data.py         # yfinance access layer (+ offline sample fallback)
   universe.py     # tracked tickers (live S&P 500 fetch or bundled list)
