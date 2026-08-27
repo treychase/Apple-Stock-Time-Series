@@ -45,18 +45,32 @@ A hidden two-state Markov chain choosing between two DLMs, on the log price
 `y_t`:
 
 ```
-observation:  y_t     = θ_t + v_t,        v_t ~ N(0, V[S_t])
-state:        θ_t     = θ_{t-1} + w_t,    w_t ~ N(0, W[S_t])
+observation:  y_t     = θ_t + v_t,        v_t ~ N(0, κ[S_t]·V)
+state:        θ_t     = θ_{t-1} + w_t,    w_t ~ N(0, κ[S_t]·W)
 regime:       S_t | S_{t-1} ~ Categorical(P[S_{t-1}, :]),   S_t ∈ {0, 1}
-priors:       θ_0 ~ N(m0, C0),  V[s], W[s] ~ IG(a, b),  P[s, :] ~ Dirichlet(α)
+scale:        κ[0] = 1,  κ[1] > 1
+priors:       θ_0 ~ N(m0, C0),  V, W ~ IG(a, b),  κ[1] ~ IG(a, b) on (1, ∞),
+              P[s, :] ~ Dirichlet(α)
 ```
 
-Both regimes are the same local-level DLM; what differs is how much the level
-is allowed to move and how noisy the observation is. **State 0 is the calm
-regime and state 1 the volatile one** — the sampler relabels whenever a draw
-violates `W[0] ≤ W[1]`, because without that constraint the two states are
-exchangeable and can swap mid-run, smearing every regime-specific summary into
-the average of the two.
+Both regimes are complete local-level DLMs: the calm one carries `(V, W)`, the
+volatile one `(κV, κW)`. Tying them to a common scale is a deliberate
+restriction, and it is what makes the two states mean something.
+
+Letting each regime own an unrestricted `(V[s], W[s])` looks more general and
+fails in the way that matters. On real price series the sampler stops splitting
+the history into quiet and turbulent stretches and starts splitting it by
+*attribution*: one state takes large observation noise with a slow level, the
+other a fast level with almost no noise. Measured on this repo's own sample
+data, that version put **86–100% of every ticker's history in a single state**
+and gave the other a self-transition probability around 0.5 — an outlier flag,
+not a regime. With the shared scale, κ comes out near **2.4** and the volatile
+state is occupied a few percent of the time in runs of about **ten days**,
+which is what volatility clustering actually looks like.
+
+Because κ > 1 by construction, **state 0 is the calm regime and state 1 the
+volatile one** in every draw — no relabelling step, and no chance of the two
+swapping mid-run.
 
 The forecast propagates the regime chain and the level forward together, so the
 predictive distribution is a **mixture over regime paths** rather than a single

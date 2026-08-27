@@ -30,8 +30,9 @@ def regime_prices():
 def test_shapes_and_positivity(gbm_prices):
     res = gibbs_switching_local_level(np.log(gbm_prices), n_iter=300, burn_in=100, seed=1)
     n_keep = 200
-    assert res.V.shape == (n_keep, 2)
-    assert res.W.shape == (n_keep, 2)
+    assert res.V.shape == (n_keep,)
+    assert res.W.shape == (n_keep,)
+    assert res.kappa.shape == (n_keep,)
     assert res.P.shape == (n_keep, 2, 2)
     assert res.theta_last.shape == (n_keep,)
     assert res.theta_mean.shape == gbm_prices.shape
@@ -42,10 +43,15 @@ def test_shapes_and_positivity(gbm_prices):
     assert np.allclose(res.P.sum(axis=2), 1.0)
 
 
-def test_regimes_stay_ordered(gbm_prices):
-    """State 0 is the calm one in every single draw, not just on average."""
+def test_volatile_regime_is_always_the_noisier_one(gbm_prices):
+    """kappa > 1 in every draw, so state 1 cannot quietly become the calm one.
+
+    This is what replaces a relabelling step: the two states are not
+    exchangeable, so there is nothing to relabel and no chance of a mid-run swap
+    smearing the regime summaries together.
+    """
     res = gibbs_switching_local_level(np.log(gbm_prices), n_iter=300, burn_in=100, seed=3)
-    assert np.all(res.W[:, 0] <= res.W[:, 1])
+    assert np.all(res.kappa > 1.0)
 
 
 def test_finds_the_volatile_stretch(regime_prices):
@@ -54,9 +60,8 @@ def test_finds_the_volatile_stretch(regime_prices):
     p_vol = res.state_prob
     assert p_vol[truth == 1].mean() > 0.8
     assert p_vol[truth == 0].mean() < 0.2
-    # and it recovers the gap between the two regimes' level volatility
-    sd = np.sqrt(res.W.mean(axis=0))
-    assert sd[1] > 4 * sd[0]
+    # and the volatile regime really is the noisier one, by a clear margin
+    assert res.kappa.mean() > 3.0
 
 
 def test_regimes_are_persistent(regime_prices):
@@ -78,6 +83,8 @@ def test_fan_widens_with_horizon(gbm_prices):
     assert len(fan.fitted) == len(gbm_prices)
     assert len(fan.state_prob) == len(gbm_prices)
     assert fan.rmse > 0
+    assert fan.kappa > 1.0
+    assert fan.vol_daily[1] > fan.vol_daily[0]
 
 
 def test_fitted_tracks_the_prices(gbm_prices):

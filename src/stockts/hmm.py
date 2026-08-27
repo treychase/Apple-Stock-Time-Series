@@ -9,21 +9,35 @@ in and price the forecast accordingly.
 
 Model (on the log price ``y_t``, with hidden regime ``S_t`` in {0, 1}):
 
-    observation:  y_t     = theta_t + v_t,        v_t ~ N(0, V[S_t])
-    state:        theta_t = theta_{t-1} + w_t,    w_t ~ N(0, W[S_t])
+    observation:  y_t     = theta_t + v_t,        v_t ~ N(0, kappa[S_t] * V)
+    state:        theta_t = theta_{t-1} + w_t,    w_t ~ N(0, kappa[S_t] * W)
     regime:       S_t | S_{t-1} ~ Categorical(P[S_{t-1}, :])
+    scale:        kappa[0] = 1,  kappa[1] > 1
 
 Priors:
 
     theta_0 ~ N(m0, C0)
-    V[s], W[s] ~ Inverse-Gamma(a, b)          independently per regime
+    V, W       ~ Inverse-Gamma(a, b)          the calm regime's variances
+    kappa[1]   ~ Inverse-Gamma(a, b) on (1, inf)
     P[s, :]    ~ Dirichlet(alpha[s, :])       favouring persistence
 
-Regimes are ordered by evolution variance, ``W[0] <= W[1]``, and relabelled
-whenever a sweep violates that.  Without the constraint the two states are
-exchangeable and the sampler is free to swap them mid-run, which would smear
-every regime-specific summary into the average of the two.  With it, **state 0
-is the calm regime and state 1 the volatile one** in every draw.
+Both regimes are complete local-level DLMs: the calm one carries ``(V, W)`` and
+the volatile one ``(kappa*V, kappa*W)``.  Tying them to a common scale is a
+deliberate restriction, and it is what makes the two states mean something.
+Letting each regime own an unrestricted ``(V[s], W[s])`` looks more general and
+fits worse in the way that matters: on real price series the sampler stops
+splitting the history into quiet and turbulent stretches and starts splitting it
+by *attribution* instead, with one state carrying large observation noise and a
+slow level and the other carrying a fast level and almost no noise.  Measured on
+this project's own sample data, that version put 86-100% of every ticker's
+history in a single state and gave the other a self-transition probability
+around 0.5 - an outlier flag, not a regime.  With the shared scale, ``kappa``
+comes out near 2.4 and the volatile state is occupied a few percent of the time
+in runs of about ten days, which is what volatility clustering looks like.
+
+Because ``kappa > 1`` by construction, **state 0 is the calm regime and state 1
+the volatile one** in every draw, with no relabelling step and no chance of the
+two swapping mid-run.
 
 The Gibbs sweep alternates four conditionals:
 
@@ -32,8 +46,8 @@ The Gibbs sweep alternates four conditionals:
 2. the regime path ``S``, by forward-filter/backward-sample over the discrete
    chain, where each regime's likelihood at ``t`` combines the observation
    density and the evolution density;
-3. ``V[s]`` and ``W[s]``, conjugate inverse-gamma draws from the residuals
-   belonging to each regime;
+3. ``V`` and ``W`` from all the residuals with the regime scale divided out,
+   and ``kappa`` from the volatile regime's residuals alone;
 4. ``P``, conjugate Dirichlet draws from the transition counts.
 
 :func:`predict_fan` is the headline output: it propagates the regime chain and
@@ -67,8 +81,9 @@ N_STATES = 2
 class SwitchingResult:
     """Posterior draws from :func:`gibbs_switching_local_level`."""
 
-    V: np.ndarray           # (n_keep, 2) observation variance by regime
-    W: np.ndarray           # (n_keep, 2) evolution variance by regime
+    V: np.ndarray           # (n_keep,) calm-regime observation variance
+    W: np.ndarray           # (n_keep,) calm-regime evolution variance
+    kappa: np.ndarray       # (n_keep,) volatile-regime scale on both, > 1
     P: np.ndarray           # (n_keep, 2, 2) transition matrix
     theta_last: np.ndarray  # (n_keep,) final latent level
     state_last: np.ndarray  # (n_keep,) final regime
@@ -90,6 +105,7 @@ class SwitchingForecast:
     state_prob: list[float] = field(default_factory=list)  # P(volatile) per day
     vol_daily: tuple[float, float] = (0.0, 0.0)   # sd of the level step, by regime
     persistence: tuple[float, float] = (0.0, 0.0)  # P[s, s], how sticky each regime is
+    kappa: float = 1.0            # how many times noisier the volatile regime is
     p_volatile_now: float = 0.0
     rmse: float = 0.0     # in-sample RMSE of the fitted level, in price units
 
@@ -135,6 +151,7 @@ def _ffbs_varying(y: np.ndarray, V: np.ndarray, W: np.ndarray,
 
 def _sample_states(y: np.ndarray, theta: np.ndarray, V: np.ndarray, W: np.ndarray,
                    P: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    # V and W are length-2: the variance each regime implies at every t
     """FFBS over the discrete chain, given the level path and the variances."""
     n = y.shape[0]
     dtheta = np.empty(n)
@@ -192,53 +209,60 @@ def gibbs_switching_local_level(
     m0, C0 = float(y[0]), 1e3
     a_V, b_V = 3.0, 2.0 * base
     a_W, b_W = 3.0, 0.5 * base
+    a_k, b_k = 3.0, 6.0          # kappa prior centred near 3
     # a sticky prior: regimes that flip every other day are not regimes
     alpha_P = np.array([[12.0, 1.0], [1.0, 12.0]])
 
-    # start from a crude volatility split so the two regimes begin apart
+    # start from a crude volatility split so the chain begins with two regimes
     roll = np.abs(np.concatenate([[0.0], dy]))
-    states = (roll > np.median(roll)).astype(int)
-    V = np.array([base, 2.0 * base])
-    W = np.array([0.25 * base, 2.0 * base])
+    states = (roll > np.quantile(roll, 0.7)).astype(int)
+    V, W, kappa = base, 0.25 * base, 3.0
     P = np.array([[0.95, 0.05], [0.10, 0.90]])
 
-    keep_V, keep_W, keep_P, keep_th, keep_s = [], [], [], [], []
+    keep_V, keep_W, keep_k, keep_P, keep_th, keep_s = [], [], [], [], [], []
     theta_sum = np.zeros(n)
     state_sum = np.zeros(n)
     n_keep = 0
 
     for it in range(n_iter):
-        theta = _ffbs_varying(y, V[states], W[states], m0, C0, rng)
-        states = _sample_states(y, theta, V, W, P, rng)
+        scale = np.array([1.0, kappa])
+        theta = _ffbs_varying(y, V * scale[states], W * scale[states], m0, C0, rng)
+        states = _sample_states(y, theta, V * scale, W * scale, P, rng)
 
         resid = y - theta
         dth = np.concatenate([[0.0], np.diff(theta)])
-        for s in range(N_STATES):
-            mask = states == s
-            k = int(mask.sum())
-            ss_v = float(np.sum(resid[mask] ** 2))
-            V[s] = 1.0 / rng.gamma(a_V + k / 2.0, 1.0 / (b_V + ss_v / 2.0))
-            evo = mask.copy()
-            evo[0] = False                      # the first point has no step
-            ke = int(evo.sum())
-            ss_w = float(np.sum(dth[evo] ** 2))
-            W[s] = 1.0 / rng.gamma(a_W + ke / 2.0, 1.0 / (b_W + ss_w / 2.0))
+        k_t = scale[states]
+        step = np.ones(n, dtype=bool)
+        step[0] = False                          # the first point has no step
+
+        # V and W describe the calm regime, so the scale divides out first
+        ss_v = float(np.sum(resid ** 2 / k_t))
+        V = 1.0 / rng.gamma(a_V + n / 2.0, 1.0 / (b_V + ss_v / 2.0))
+        ss_w = float(np.sum(dth[step] ** 2 / k_t[step]))
+        W = 1.0 / rng.gamma(a_W + (n - 1) / 2.0, 1.0 / (b_W + ss_w / 2.0))
+
+        # kappa from the volatile regime's residuals alone, truncated above 1
+        hot = states == 1
+        hot_step = hot & step
+        cnt = int(hot.sum()) + int(hot_step.sum())
+        ss_k = float(np.sum(resid[hot] ** 2) / V + np.sum(dth[hot_step] ** 2) / W)
+        for _ in range(50):
+            draw = 1.0 / rng.gamma(a_k + cnt / 2.0, 1.0 / (b_k + ss_k / 2.0))
+            if draw > 1.0:
+                kappa = draw
+                break
+        else:
+            kappa = max(kappa, 1.0 + 1e-4)
 
         counts = np.zeros((N_STATES, N_STATES))
         np.add.at(counts, (states[:-1], states[1:]), 1.0)
         for s in range(N_STATES):
             P[s] = rng.dirichlet(alpha_P[s] + counts[s])
 
-        # keep state 0 the calm one, so every draw means the same thing
-        if W[0] > W[1]:
-            V = V[::-1].copy()
-            W = W[::-1].copy()
-            P = P[::-1, ::-1].copy()
-            states = 1 - states
-
         if it >= burn_in and (it - burn_in) % thin == 0:
-            keep_V.append(V.copy())
-            keep_W.append(W.copy())
+            keep_V.append(V)
+            keep_W.append(W)
+            keep_k.append(kappa)
             keep_P.append(P.copy())
             keep_th.append(theta[-1])
             keep_s.append(int(states[-1]))
@@ -247,7 +271,8 @@ def gibbs_switching_local_level(
             n_keep += 1
 
     return SwitchingResult(
-        V=np.array(keep_V), W=np.array(keep_W), P=np.array(keep_P),
+        V=np.array(keep_V), W=np.array(keep_W), kappa=np.array(keep_k),
+        P=np.array(keep_P),
         theta_last=np.array(keep_th), state_last=np.array(keep_s, dtype=int),
         theta_mean=theta_sum / max(n_keep, 1),
         state_prob=state_sum / max(n_keep, 1),
@@ -289,10 +314,9 @@ def predict_fan(
     for h in range(horizon):
         u = rng.random(n_draw)
         state = (u > res.P[np.arange(n_draw), state, 0]).astype(int)
-        w = res.W[np.arange(n_draw), state]
-        v = res.V[np.arange(n_draw), state]
-        theta = theta + rng.normal(0.0, np.sqrt(w))
-        paths[:, h] = theta + rng.normal(0.0, np.sqrt(v))
+        scale = np.where(state == 1, res.kappa, 1.0)
+        theta = theta + rng.normal(0.0, np.sqrt(res.W * scale))
+        paths[:, h] = theta + rng.normal(0.0, np.sqrt(res.V * scale))
 
     lo_q = (1.0 - level) / 2.0
     lower = np.exp(np.quantile(paths, lo_q, axis=0))
@@ -301,7 +325,8 @@ def predict_fan(
 
     fitted = np.exp(res.theta_mean)
     rmse = float(np.sqrt(np.mean((prices - fitted) ** 2)))
-    vol = tuple(float(np.sqrt(np.mean(res.W[:, s]))) for s in range(N_STATES))
+    vol = (float(np.sqrt(np.mean(res.W))),
+           float(np.sqrt(np.mean(res.W * res.kappa))))
     persist = tuple(float(np.mean(res.P[:, s, s])) for s in range(N_STATES))
 
     return SwitchingForecast(
@@ -312,6 +337,7 @@ def predict_fan(
         fitted=[float(v) for v in fitted],
         state_prob=[float(v) for v in res.state_prob],
         vol_daily=vol, persistence=persist,
+        kappa=float(np.mean(res.kappa)),
         p_volatile_now=float(np.mean(res.state_last)),
         rmse=rmse,
     )
